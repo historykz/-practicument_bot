@@ -41,7 +41,7 @@ if not ADMINS_RAW:
 ADMINS = {int(x.strip()) for x in ADMINS_RAW.split(",") if x.strip().isdigit()}
 
 DB_PATH = "ent_bot.db"
-BUY_CONTACT = "@your_manager_username"  # поменяй на свой @username
+BUY_CONTACT = "@historyentk_bot"  
 
 # Ограничение Telegram на open_period у poll
 MIN_TIMER = 5
