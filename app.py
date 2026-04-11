@@ -589,7 +589,7 @@ def build_group_lobby_keyboard() -> InlineKeyboardMarkup:
 
 def build_private_card_keyboard(test_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ Начать тест", callback_data=f"start_private_test:{test_id}")],
+        [InlineKeyboardButton("Пройти тест", callback_data=f"start_private_test:{test_id}")],
     ])
 
 
@@ -772,1515 +772,235 @@ async def open_test_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text("В этом тесте пока нет вопросов.")
         return
 
-    # В личном чате — показываем карточку с кнопкой «Начать»
     if query.message.chat.type == "private":
         text = (
             f"📚 Тест: {test['title']}\n"
             f"🖊 Вопросов: {len(questions)}\n"
             f"⏱ {int(test['question_timer'])} сек на вопрос\n"
-            f"{'🔓 Бесплатный' if test['access_type'] == 'free' else '🔒 Платный'}"
+                        f"\nГотовы начать?"
         )
+
         await query.message.reply_text(
             text,
             reply_markup=build_private_card_keyboard(test_id),
-            protect_content=protect_for_user(query.from_user.id),
         )
-        return
 
-    # В группе — сразу запускаем
-    await start_private_test(
-        application=context.application,
-        user_id=query.from_user.id,
-        chat_id=query.message.chat_id,
-        test_id=test_id,
-    )
+    else:
+        await start_group_quiz(update, context, test_id)
 
 
-async def start_private_test_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_private_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     test_id = int(query.data.split(":")[1])
 
-    await start_private_test(
-        application=context.application,
-        user_id=query.from_user.id,
-        chat_id=query.message.chat_id,
-        test_id=test_id,
-    )
-
-
-async def start_private_test(application: Application, user_id: int, chat_id: int, test_id: int) -> None:
-    test = get_test_by_id(test_id)
     questions = get_questions_for_test(test_id)
 
-    if not test or not questions:
-        await application.bot.send_message(chat_id=chat_id, text="Тест не найден или пуст.")
-        return
+    session_store = get_sessions_store(context.application)
 
-    sessions = get_sessions_store(application)
-    if user_id in sessions:
-        await finish_user_test(application, user_id, send_result=False)
-
-    sessions[user_id] = {
-        "user_id": user_id,
-        "chat_id": chat_id,
+    session_store[query.from_user.id] = {
         "test_id": test_id,
-        "test_title": test["title"],
-        "timer": int(test["question_timer"]),
-        "questions": [dict(q) for q in questions],
-        "current_index": 0,
+        "questions": questions,
+        "current": 0,
         "score": 0,
-        "active": True,
-        "current_poll_id": None,
-        "current_poll_message_id": None,
-        "current_control_message_id": None,
-        "current_correct_option_index": None,
-        "answered_current": False,
+        "start_time": time.time(),
     }
 
-    await application.bot.send_message(
-        chat_id=chat_id,
-        text=f"▶️ Начинаем тест: {test['title']}\n⏱ Таймер на каждый вопрос: {int(test['question_timer'])} сек",
-        protect_content=protect_for_user(user_id),
-    )
+    await send_private_question(query.from_user.id, context)
 
-    await send_next_question(application, user_id)
 
-
-async def send_next_question(application: Application, user_id: int) -> None:
-    sessions = get_sessions_store(application)
-    poll_map = get_poll_map(application)
-
-    session = sessions.get(user_id)
-    if not session or not session["active"]:
-        return
-
-    idx = session["current_index"]
-    questions = session["questions"]
-
-    if idx >= len(questions):
-        await finish_user_test(application, user_id, send_result=True)
-        return
-
-    q = questions[idx]
-    options_rows = get_options_for_question(q["id"])
-
-    shuffled = [{
-        "text": row["option_text"],
-        "is_correct": int(row["is_correct"]) == 1,
-    } for row in options_rows]
-
-    random.shuffle(shuffled)
-
-    option_texts = [x["text"] for x in shuffled]
-    correct_index = next(i for i, x in enumerate(shuffled) if x["is_correct"])
-
-    progress_text = f"Вопрос {idx + 1}/{len(questions)}\n{q['question_text']}"
-
-    poll_message = await application.bot.send_poll(
-        chat_id=session["chat_id"],
-        question=progress_text,
-        options=option_texts,
-        type=PollType.QUIZ,
-        correct_option_id=correct_index,
-        is_anonymous=False,
-        open_period=session["timer"],
-        protect_content=protect_for_user(user_id),
-    )
-
-    session["current_poll_id"] = poll_message.poll.id
-    session["current_poll_message_id"] = poll_message.message_id
-    session["current_correct_option_index"] = correct_index
-    session["answered_current"] = False
-
-    poll_map[poll_message.poll.id] = user_id
-
-    control_message = await application.bot.send_message(
-        chat_id=session["chat_id"],
-        text=f"⏱ На ответ {session['timer']} сек.",
-        protect_content=protect_for_user(user_id),
-    )
-    session["current_control_message_id"] = control_message.message_id
-
-    application.job_queue.run_once(
-        private_quiz_timeout_job,
-        when=session["timer"] + 1,
-        data={"user_id": user_id, "poll_id": poll_message.poll.id},
-        name=f"private_timeout_{user_id}_{poll_message.poll.id}",
-    )
-
-
-async def private_quiz_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    application = context.application
-    data = context.job.data
-    user_id = data["user_id"]
-    poll_id = data["poll_id"]
-
-    sessions = get_sessions_store(application)
-    session = sessions.get(user_id)
-
-    if not session or not session["active"]:
-        return
-    if session["current_poll_id"] != poll_id:
-        return
-    if session["answered_current"]:
-        return
-
-    session["answered_current"] = True
-    session["current_index"] += 1
-
-    await safe_delete_message(application, session["chat_id"], session.get("current_control_message_id"))
-    session["current_control_message_id"] = None
-
-    await send_next_question(application, user_id)
-
-
-async def finish_test_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    await finish_user_test(context.application, query.from_user.id, send_result=True)
-
-
-async def finish_user_test(application: Application, user_id: int, send_result: bool = True) -> None:
-    sessions = get_sessions_store(application)
-    poll_map = get_poll_map(application)
-
-    session = sessions.get(user_id)
-    if not session:
-        return
-
-    chat_id = session["chat_id"]
-    test_id = session["test_id"]
-    title = session["test_title"]
-    score = session["score"]
-    total = len(session["questions"])
-
-    try:
-        if session.get("current_poll_message_id"):
-            await application.bot.stop_poll(chat_id=chat_id, message_id=session["current_poll_message_id"])
-    except Exception:
-        pass
-
-    await safe_delete_message(application, chat_id, session.get("current_control_message_id"))
-
-    if session.get("current_poll_id"):
-        poll_map.pop(session["current_poll_id"], None)
-
-    if session["current_index"] > 0:
-        save_result(user_id, test_id, score, total)
-
-    sessions.pop(user_id, None)
-
-    if not send_result:
-        return
-
-    percent = round((score / total) * 100, 1) if total else 0
-    await application.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"✅ Тест завершён.\n\n"
-            f"📚 {title}\n"
-            f"🏆 Результат: {score}/{total}\n"
-            f"📈 Процент: {percent}%"
-        ),
-        protect_content=protect_for_user(user_id),
-    )
-
-    if chat_id > 0:
-        await application.bot.send_message(
-            chat_id=chat_id,
-            text="Выберите предмет для практики:",
-            reply_markup=main_menu_kb(user_id),
-            protect_content=protect_for_user(user_id),
-        )
-
-
-# =========================================================
-# ГРУППОВОЙ ТЕСТ
-# =========================================================
-
-async def create_group_lobby(application: Application, chat_id: int, creator_id: int, test_id: int) -> bool:
-    test = get_test_by_id(test_id)
-    questions = get_questions_for_test(test_id)
-
-    if not test or not questions:
-        await application.bot.send_message(chat_id=chat_id, text="Тест не найден или в нём нет вопросов.")
-        return False
-
-    sessions = get_group_quiz_store(application)
-    current = sessions.get(chat_id)
-    if current and current.get("active"):
-        await application.bot.send_message(chat_id=chat_id, text="В этом чате уже есть активный тест.")
-        return False
-
-    lobby_msg = await application.bot.send_message(
-        chat_id=chat_id,
-        text=build_group_lobby_text(test["title"], len(questions), int(test["question_timer"]), 0),
-        reply_markup=build_group_lobby_keyboard(),
-    )
-
-    sessions[chat_id] = {
-        "active": True,
-        "started": False,
-        "paused": False,
-        "chat_id": chat_id,
-        "created_by": creator_id,
-        "title": test["title"],
-        "test_id": test_id,
-        "timer": int(test["question_timer"]),
-        "questions": [dict(q) for q in questions],
-        "current_index": 0,
-        "participants": {},
-        "announcement_message_id": lobby_msg.message_id,
-        "current_poll_id": None,
-        "current_poll_message_id": None,
-        "current_poll_started_at": None,
-        "current_control_message_id": None,
-        "countdown_message_ids": [],
-        "no_answer_streak": 0,
-    }
-    return True
-
-
-async def group_launch_test_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(query.from_user.id):
-        await query.message.reply_text("У вас нет доступа.")
-        return ConversationHandler.END
-
-    if query.message.chat.type == "private":
-        await query.message.reply_text("Эту функцию нужно запускать только в группе.")
-        return ConversationHandler.END
-
-    test_id = int(query.data.split(":")[1])
-    ok = await create_group_lobby(
-        application=context.application,
-        chat_id=query.message.chat_id,
-        creator_id=query.from_user.id,
-        test_id=test_id,
-    )
-
-    await query.message.reply_text(
-        "✅ Лобби теста создано." if ok else "Не удалось создать лобби.",
-        reply_markup=admin_menu_kb(),
-    )
-    return ADMIN_MENU
-
-
-async def group_join_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat_id
-    sessions = get_group_quiz_store(context.application)
-    session = sessions.get(chat_id)
-
-    if not session or not session.get("active"):
-        await query.answer("Лобби не найдено.", show_alert=True)
-        return
-
-    if session.get("started") and not session.get("paused"):
-        await query.answer("Тест уже начался.", show_alert=True)
-        return
-
-    user = query.from_user
-    if user.id not in session["participants"]:
-        session["participants"][user.id] = {
-            "name": f"@{user.username}" if user.username else (user.full_name or f"id{user.id}"),
-            "score": 0,
-            "time_spent": 0.0,
-        }
-
-    ready_count = len(session["participants"])
-
-    try:
-        await query.message.edit_text(
-            text=build_group_lobby_text(
-                session["title"],
-                len(session["questions"]),
-                session["timer"],
-                ready_count,
-            ),
-            reply_markup=build_group_lobby_keyboard(),
-        )
-    except Exception:
-        pass
-
-    if ready_count >= MIN_GROUP_PLAYERS and not session["started"]:
-        session["started"] = True
-        session["paused"] = False
-        session["no_answer_streak"] = 0
-
-        await run_group_countdown(context.application, chat_id)
-        await send_next_group_question(context.application, chat_id)
-
-
-async def run_group_countdown(application: Application, chat_id: int) -> None:
-    sessions = get_group_quiz_store(application)
-    session = sessions.get(chat_id)
-    if not session or not session.get("active"):
-        return
-
-    ids = []
-
-    msg = await application.bot.send_message(chat_id=chat_id, text="🚀 Достаточно участников. Начинаем тест!")
-    ids.append(msg.message_id)
-
-    for n in [3, 2, 1]:
-        m = await application.bot.send_message(chat_id=chat_id, text=f"⏳ {n}...")
-        ids.append(m.message_id)
-        await asyncio.sleep(1)
-
-    session["countdown_message_ids"] = ids
-
-
-async def send_next_group_question(application: Application, chat_id: int) -> None:
-    sessions = get_group_quiz_store(application)
-    group_poll_map = get_group_poll_map(application)
-
-    session = sessions.get(chat_id)
-    if not session or not session.get("active") or session.get("paused"):
-        return
-
-    for msg_id in session.get("countdown_message_ids", []):
-        await safe_delete_message(application, chat_id, msg_id)
-    session["countdown_message_ids"] = []
-
-    idx = session["current_index"]
-    questions = session["questions"]
-
-    if idx >= len(questions):
-        await finish_group_quiz(application, chat_id)
-        return
-
-    q = questions[idx]
-    options_rows = get_options_for_question(q["id"])
-
-    shuffled = [{
-        "text": row["option_text"],
-        "is_correct": int(row["is_correct"]) == 1,
-    } for row in options_rows]
-
-    random.shuffle(shuffled)
-
-    option_texts = [x["text"] for x in shuffled]
-    correct_index = next(i for i, x in enumerate(shuffled) if x["is_correct"])
-
-    poll_question = f"Вопрос {idx + 1}/{len(questions)}\n{q['question_text']}"
-
-    poll_msg = await application.bot.send_poll(
-        chat_id=chat_id,
-        question=poll_question,
-        options=option_texts,
-        type=PollType.QUIZ,
-        correct_option_id=correct_index,
-        is_anonymous=False,
-        open_period=session["timer"],
-        protect_content=False,
-    )
-
-    session["current_poll_id"] = poll_msg.poll.id
-    session["current_poll_message_id"] = poll_msg.message_id
-    session["current_poll_started_at"] = time.time()
-
-    control = await application.bot.send_message(
-        chat_id=chat_id,
-        text=f"⏱ На ответ {session['timer']} сек.",
-        protect_content=False,
-    )
-    session["current_control_message_id"] = control.message_id
-
-    group_poll_map[poll_msg.poll.id] = {
-        "chat_id": chat_id,
-        "correct_index": correct_index,
-        "answered_users": set(),
-    }
-
-    application.job_queue.run_once(
-        group_advance_question_job,
-        when=session["timer"] + 1,
-        data={"chat_id": chat_id, "poll_id": poll_msg.poll.id},
-        name=f"group_quiz_{chat_id}_{idx}",
-    )
-
-
-async def group_advance_question_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    application = context.application
-    chat_id = context.job.data["chat_id"]
-    poll_id = context.job.data["poll_id"]
-
-    sessions = get_group_quiz_store(application)
-    group_poll_map = get_group_poll_map(application)
-
-    session = sessions.get(chat_id)
-    if not session or not session.get("active"):
-        return
-    if session.get("current_poll_id") != poll_id:
-        return
-
-    poll_meta = group_poll_map.get(poll_id, {})
-    answered_users = poll_meta.get("answered_users", set())
-
-    try:
-        if session.get("current_poll_message_id"):
-            await application.bot.stop_poll(chat_id=chat_id, message_id=session["current_poll_message_id"])
-    except Exception:
-        pass
-
-    await safe_delete_message(application, chat_id, session.get("current_control_message_id"))
-
-    if len(answered_users) == 0:
-        session["no_answer_streak"] += 1
-    else:
-        session["no_answer_streak"] = 0
-
-    session["current_index"] += 1
-
-    session["current_poll_id"] = None
-    session["current_control_message_id"] = None
-
-    group_poll_map.pop(poll_id, None)
-
-    total_questions = len(session["questions"])
-    answered_count = session["current_index"]
-
-    if session["no_answer_streak"] >= NO_ANSWER_STREAK_LIMIT:
-        session["paused"] = True
-        await application.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "⏸ Тест поставлен на паузу.\n\n"
-                "Два вопроса подряд остались без ответов.\n\n"
-                f"Пройдено вопросов: {answered_count}/{total_questions}\n"
-                "Выберите действие:"
-            ),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ Продолжить", callback_data=f"group_continue:{chat_id}")],
-                [InlineKeyboardButton("⏹ Завершить тест", callback_data=f"group_finish:{chat_id}")],
-            ]),
-        )
-        return
-
-    await send_next_group_question(application, chat_id)
-
-
-async def continue_group_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = int(query.data.split(":")[1])
-    sessions = get_group_quiz_store(context.application)
-    session = sessions.get(chat_id)
-
-    if not session or not session.get("active"):
-        await query.answer("Активный тест не найден.", show_alert=True)
-        return
-
-    session["paused"] = False
-    session["no_answer_streak"] = 0
-
-    await run_group_countdown(context.application, chat_id)
-    await send_next_group_question(context.application, chat_id)
-
-
-async def finish_group_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = int(query.data.split(":")[1])
-
-    if not is_admin(query.from_user.id):
-        await query.answer("Завершить тест может только админ.", show_alert=True)
-        return
-
-    await finish_group_quiz(context.application, chat_id)
-
-
-async def finish_group_quiz(application: Application, chat_id: int) -> None:
-    sessions = get_group_quiz_store(application)
-    group_poll_map = get_group_poll_map(application)
-
-    session = sessions.get(chat_id)
-    if not session:
-        return
-
-    try:
-        if session.get("current_poll_message_id"):
-            await application.bot.stop_poll(chat_id=chat_id, message_id=session["current_poll_message_id"])
-    except Exception:
-        pass
-
-    await safe_delete_message(application, chat_id, session.get("current_control_message_id"))
-
-    if session.get("current_poll_id"):
-        group_poll_map.pop(session["current_poll_id"], None)
-
-    participants = list(session["participants"].values())
-    participants.sort(key=lambda x: (-x["score"], x["time_spent"]))
-
-    total_questions = len(session["questions"])
-    lines = [
-        f"🏁 Тест «{session['title']}» завершён!",
-        "",
-        f"🖊 Всего вопросов: {total_questions}",
-        "",
-    ]
-
-    if not participants:
-        lines.append("Пока нет участников.")
-    else:
-        medals = ["🥇", "🥈", "🥉"]
-        for i, p in enumerate(participants, start=1):
-            prefix = medals[i - 1] if i <= 3 else f"{i}."
-            lines.append(f"{prefix} {p['name']} — {p['score']} ({format_elapsed(p['time_spent'])})")
-
-    await application.bot.send_message(chat_id=chat_id, text="\n".join(lines))
-
-    sessions.pop(chat_id, None)
-
-
-async def stop_group_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    if update.effective_chat.type == "private":
-        return
-
-    if not is_admin(update.effective_user.id):
-        return
-
-    chat_id = update.effective_chat.id
-    sessions = get_group_quiz_store(context.application)
-
-    if chat_id not in sessions or not sessions[chat_id].get("active"):
-        return
-
-    await finish_group_quiz(context.application, chat_id)
-
-
-async def group_message_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    if not is_group_chat(update.effective_chat.type):
-        return
-
-    user_id = update.effective_user.id
-    if is_admin(user_id):
-        return
-
-    sessions = get_group_quiz_store(context.application)
-    session = sessions.get(update.effective_chat.id)
-
-    if not session:
-        return
-    if not session.get("active"):
-        return
-    if not session.get("started"):
-        return
-    if session.get("paused"):
-        return
-
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
-
-# =========================================================
-# POLL ANSWERS
-# =========================================================
-
-async def handle_group_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    answer = update.poll_answer
-    poll_id = answer.poll_id
-    user = answer.user
-    selected_option_ids = answer.option_ids
-
-    group_poll_map = get_group_poll_map(context.application)
-    poll_meta = group_poll_map.get(poll_id)
-    if not poll_meta:
-        return False
-
-    chat_id = poll_meta["chat_id"]
-    sessions = get_group_quiz_store(context.application)
-    session = sessions.get(chat_id)
-
-    if not session or not session.get("active"):
-        return True
-
-    if user.id not in session["participants"]:
-        session["participants"][user.id] = {
-            "name": f"@{user.username}" if user.username else (user.full_name or "Участник"),
-            "score": 0,
-            "time_spent": 0.0,
-        }
-
-    if user.id in poll_meta["answered_users"]:
-        return True
-
-    poll_meta["answered_users"].add(user.id)
-
-    selected_index = selected_option_ids[0] if selected_option_ids else None
-    correct_index = poll_meta["correct_index"]
-
-    elapsed = 0.0
-    if session.get("current_poll_started_at"):
-        elapsed = max(0.0, time.time() - session["current_poll_started_at"])
-
-    session["participants"][user.id]["time_spent"] += elapsed
-
-    if selected_index is not None and selected_index == correct_index:
-        session["participants"][user.id]["score"] += 1
-
-    return True
-
-
-async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    handled_group = await handle_group_poll_answer(update, context)
-    if handled_group:
-        return
-
-    answer = update.poll_answer
-    user_id = answer.user.id
-    poll_id = answer.poll_id
-    selected_option_ids = answer.option_ids
+async def send_private_question(user_id, context):
 
     sessions = get_sessions_store(context.application)
     poll_map = get_poll_map(context.application)
 
-    owner_user_id = poll_map.get(poll_id)
-    if owner_user_id != user_id:
+    session = sessions[user_id]
+
+    if session["current"] >= len(session["questions"]):
+        await finish_private_test(user_id, context)
         return
 
-    session = sessions.get(user_id)
-    if not session or not session["active"]:
-        return
-    if session["current_poll_id"] != poll_id:
-        return
-    if session["answered_current"]:
+    question = session["questions"][session["current"]]
+    options = get_options_for_question(question["id"])
+
+    option_texts = [x["option_text"] for x in options]
+    correct_index = next(i for i,x in enumerate(options) if x["is_correct"])
+
+    poll = await context.bot.send_poll(
+        chat_id=user_id,
+        question=f"Вопрос {session['current']+1}/{len(session['questions'])}\n\n{question['question_text']}",
+        options=option_texts,
+        type=PollType.QUIZ,
+        correct_option_id=correct_index,
+        is_anonymous=False,
+    )
+
+    poll_map[poll.poll.id] = user_id
+
+
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    poll_map = get_poll_map(context.application)
+    sessions = get_sessions_store(context.application)
+
+    poll_id = update.poll_answer.poll_id
+
+    if poll_id not in poll_map:
         return
 
-    session["answered_current"] = True
+    user_id = poll_map[poll_id]
 
-    selected_index = selected_option_ids[0] if selected_option_ids else None
-    correct_index = session["current_correct_option_index"]
+    if user_id not in sessions:
+        return
 
-    if selected_index is not None and selected_index == correct_index:
+    session = sessions[user_id]
+
+    selected = update.poll_answer.option_ids[0]
+
+    question = session["questions"][session["current"]]
+    options = get_options_for_question(question["id"])
+
+    correct = next(i for i,x in enumerate(options) if x["is_correct"])
+
+    if selected == correct:
         session["score"] += 1
 
-    session["current_index"] += 1
+    session["current"] += 1
 
-    await safe_delete_message(context.application, session["chat_id"], session.get("current_control_message_id"))
-    session["current_control_message_id"] = None
+    await asyncio.sleep(1)
 
-    await send_next_question(context.application, user_id)
+    await send_private_question(user_id, context)
 
 
-# =========================================================
-# НАЗАД
-# =========================================================
+async def finish_private_test(user_id, context):
 
-async def back_to_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    await query.message.reply_text(
-        "Выберите предмет для практики:",
-        reply_markup=main_menu_kb(query.from_user.id),
-        protect_content=protect_for_user(query.from_user.id),
+    sessions = get_sessions_store(context.application)
+    session = sessions[user_id]
+
+    score = session["score"]
+    total = len(session["questions"])
+    test_id = session["test_id"]
+
+    elapsed = time.time() - session["start_time"]
+
+    save_result(user_id, test_id, score, total)
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=f"🏁 Тест завершен\n\nПравильных ответов: {score}/{total}\nВремя: {format_elapsed(elapsed)}"
     )
 
+    del sessions[user_id]
 
-async def back_to_subject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
 
-    subject = query.data.split(":", 1)[1]
-    await query.message.reply_text(
-        "Выберите тему практики:",
-        reply_markup=build_topics_keyboard(subject),
-        protect_content=protect_for_user(query.from_user.id),
-    )
+async def start_group_quiz(update, context, test_id):
 
+    chat_id = update.callback_query.message.chat.id
 
-# =========================================================
-# АДМИНКА
-# =========================================================
-
-async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("У вас нет доступа.", protect_content=True)
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "Админ-панель.\nВыберите действие:",
-        reply_markup=admin_menu_kb(),
-        protect_content=False,
-    )
-    return ADMIN_MENU
-
-
-async def admin_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-
-    text = update.message.text
-
-    if text == "Создать тест":
-        await update.message.reply_text(
-            "Выберите раздел, куда сохранить тест:",
-            reply_markup=create_subject_kb(),
-            protect_content=False,
-        )
-        return CREATE_TEST_SUBJECT
-
-    if text == "Выдать доступ":
-        tests = get_all_tests()
-        if not tests:
-            await update.message.reply_text("Сначала создайте тест.")
-            return ADMIN_MENU
-
-        await update.message.reply_text(
-            "Выберите тест, к которому нужно выдать доступ:",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await update.message.reply_text(
-            "Список тестов ниже:",
-            reply_markup=build_tests_inline_keyboard("grant_test"),
-        )
-        return GRANT_ACCESS_SELECT_TEST
-
-    if text == "Убрать доступ":
-        tests = get_all_tests()
-        if not tests:
-            await update.message.reply_text("Сначала создайте тест.")
-            return ADMIN_MENU
-
-        await update.message.reply_text(
-            "Выберите тест, у которого нужно убрать доступ:",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await update.message.reply_text(
-            "Список тестов ниже:",
-            reply_markup=build_tests_inline_keyboard("revoke_test"),
-        )
-        return REVOKE_ACCESS_SELECT_TEST
-
-    if text == "Изменить тест":
-        tests = get_all_tests()
-        if not tests:
-            await update.message.reply_text("Сначала создайте тест.")
-            return ADMIN_MENU
-
-        await update.message.reply_text(
-            "Выберите тест для редактирования:",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await update.message.reply_text(
-            "Список тестов ниже:",
-            reply_markup=build_tests_inline_keyboard("edit_test"),
-        )
-        return EDIT_TEST_SELECT
-
-    if text == "Удалить тест":
-        tests = get_all_tests()
-        if not tests:
-            await update.message.reply_text("Сначала создайте тест.")
-            return ADMIN_MENU
-
-        await update.message.reply_text(
-            "Выберите тест для удаления:",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await update.message.reply_text(
-            "Список тестов ниже:",
-            reply_markup=build_tests_inline_keyboard("delete_test"),
-        )
-        return DELETE_TEST_SELECT
-
-    if text == "Запустить тест в этом чате":
-        if update.effective_chat.type == "private":
-            await update.message.reply_text("Эту функцию нужно запускать из группы.")
-            return ADMIN_MENU
-
-        tests = get_all_tests()
-        if not tests:
-            await update.message.reply_text("Сначала создайте тест.")
-            return ADMIN_MENU
-
-        await update.message.reply_text(
-            "Выберите тест для запуска в этом чате:",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await update.message.reply_text(
-            "Список тестов ниже:",
-            reply_markup=build_tests_inline_keyboard("group_launch_test"),
-        )
-        return GROUP_LAUNCH_SELECT
-
-    if text == "Назад в меню":
-        await update.message.reply_text(
-            "Главное меню:",
-            reply_markup=main_menu_kb(update.effective_user.id),
-        )
-        return ConversationHandler.END
-
-    await update.message.reply_text("Выберите действие через кнопки.")
-    return ADMIN_MENU
-
-
-# =========================================================
-# СОЗДАНИЕ ТЕСТА
-# =========================================================
-
-async def create_test_subject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-
-    if text == "Назад в меню":
-        await update.message.reply_text("Админ-панель:", reply_markup=admin_menu_kb())
-        return ADMIN_MENU
-
-    code = subject_code(text)
-    if not code:
-        await update.message.reply_text("Выберите раздел через кнопки.")
-        return CREATE_TEST_SUBJECT
-
-    context.user_data["new_test_subject"] = code
-    await update.message.reply_text("Введите название темы или теста:")
-    return CREATE_TEST_NAME
-
-
-async def create_test_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["new_test_title"] = update.message.text.strip()
-    await update.message.reply_text("Выберите доступ:", reply_markup=access_kb())
-    return CREATE_TEST_ACCESS
-
-
-async def create_test_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip().lower()
-
-    if text == "назад в меню":
-        await update.message.reply_text("Админ-панель:", reply_markup=admin_menu_kb())
-        return ADMIN_MENU
-
-    if text == "бесплатный":
-        context.user_data["new_test_access"] = "free"
-    elif text == "платный":
-        context.user_data["new_test_access"] = "paid"
-    else:
-        await update.message.reply_text("Нажмите: Бесплатный или Платный")
-        return CREATE_TEST_ACCESS
-
-    await update.message.reply_text(
-        f"Теперь введите таймер на каждый вопрос в секундах.\n\n"
-        f"Минимум: {MIN_TIMER}\nМаксимум: {MAX_TIMER}\n\nНапример: 30"
-    )
-    return CREATE_TEST_TIMER
-
-
-async def create_test_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = update.message.text.strip()
-
-    if not raw.isdigit():
-        await update.message.reply_text("Введите число в секундах. Например: 30")
-        return CREATE_TEST_TIMER
-
-    timer = int(raw)
-    if timer < MIN_TIMER or timer > MAX_TIMER:
-        await update.message.reply_text(f"Таймер должен быть от {MIN_TIMER} до {MAX_TIMER} секунд.")
-        return CREATE_TEST_TIMER
-
-    context.user_data["new_test_timer"] = timer
-
-    await update.message.reply_text(
-        "Теперь отправьте вопросы одним сообщением.\n\n"
-        "Каждый вопрос отделяйте пустой строкой.\n"
-        "Правильный ответ отмечайте звездочкой *\n\n"
-        "Пример:\n\n"
-        "Абылай хан кто он:\n"
-        "А) хан*\n"
-        "Б) раб\n"
-        "В) батыр\n"
-        "Г) аксакал\n\n"
-        "В каком году образовалось Казахское ханство?\n"
-        "А) 1465*\n"
-        "Б) 1219\n"
-        "В) 1731\n"
-        "Г) 1917",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return CREATE_TEST_QUESTIONS
-
-
-async def create_test_questions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = update.message.text.strip()
-
-    subject = context.user_data.get("new_test_subject")
-    title = context.user_data.get("new_test_title")
-    access_type = context.user_data.get("new_test_access")
-    question_timer = context.user_data.get("new_test_timer", 30)
-
-    if not subject or not title or not access_type:
-        await update.message.reply_text("Ошибка данных. Начните заново.")
-        return ConversationHandler.END
-
-    try:
-        parsed_questions = parse_bulk_questions(raw)
-    except ValueError as e:
-        await update.message.reply_text(
-            f"❌ Ошибка в формате вопросов:\n\n{e}\n\nПопробуйте отправить заново."
-        )
-        return CREATE_TEST_QUESTIONS
-
-    test_id = create_test(
-        subject=subject,
-        title=title,
-        access_type=access_type,
-        created_by=update.effective_user.id,
-        question_timer=question_timer,
-    )
-
-    for i, q in enumerate(parsed_questions, start=1):
-        add_question(
-            test_id=test_id,
-            question_text=q["question_text"],
-            options=q["options"],
-            position=i,
-        )
-
-    await update.message.reply_text(
-        f"✅ Тест сохранён!\n\n"
-        f"ID: {test_id}\n"
-        f"Раздел: {subject_label(subject)}\n"
-        f"Название: {title}\n"
-        f"Доступ: {'Бесплатный' if access_type == 'free' else 'Платный'}\n"
-        f"Таймер: {question_timer} сек\n"
-        f"Вопросов: {len(parsed_questions)}",
-        reply_markup=admin_menu_kb(),
-    )
-
-    for key in ["new_test_subject", "new_test_title", "new_test_access", "new_test_timer"]:
-        context.user_data.pop(key, None)
-
-    return ADMIN_MENU
-
-
-# =========================================================
-# ДОСТУП
-# =========================================================
-
-async def grant_test_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(query.from_user.id):
-        await query.message.reply_text("У вас нет доступа.")
-        return ConversationHandler.END
-
-    test_id = int(query.data.split(":")[1])
-    test = get_test_by_id(test_id)
-
-    if not test:
-        await query.message.reply_text("Тест не найден.")
-        return GRANT_ACCESS_SELECT_TEST
-
-    context.user_data["grant_test_id"] = test_id
-    await query.message.reply_text(
-        f"Выбран тест:\n#{test['id']} | {test['title']}\n\n"
-        f"Теперь отправьте Telegram ID пользователя."
-    )
-    return GRANT_ACCESS_ENTER_USER_ID
-
-
-async def grant_access_enter_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = update.message.text.strip()
-    test_id = context.user_data.get("grant_test_id")
-
-    if not test_id:
-        await update.message.reply_text("Ошибка. Начните заново.")
-        return ConversationHandler.END
-
-    if not raw.isdigit():
-        await update.message.reply_text("Отправьте только Telegram ID цифрами.")
-        return GRANT_ACCESS_ENTER_USER_ID
-
-    telegram_id = int(raw)
-    grant_access(telegram_id, test_id)
+    group_store = get_group_quiz_store(context.application)
 
     test = get_test_by_id(test_id)
-    await update.message.reply_text(
-        f"✅ Доступ выдан.\n\nПользователь ID: {telegram_id}\nТест: {test['title']}",
-        reply_markup=admin_menu_kb(),
+    questions = get_questions_for_test(test_id)
+
+    group_store[chat_id] = {
+        "test_id": test_id,
+        "questions": questions,
+        "current": 0,
+        "players": set(),
+        "scores": {},
+        "no_answers": 0,
+        "started": False
+    }
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=build_group_lobby_text(test["title"], len(questions), test["question_timer"]),
+        reply_markup=build_group_lobby_keyboard()
     )
 
-    context.user_data.pop("grant_test_id", None)
-    return ADMIN_MENU
 
+async def join_group_quiz(update, context):
 
-async def revoke_test_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
-    if not is_admin(query.from_user.id):
-        await query.message.reply_text("У вас нет доступа.")
-        return ConversationHandler.END
+    chat_id = query.message.chat.id
+    user_id = query.from_user.id
 
-    test_id = int(query.data.split(":")[1])
-    test = get_test_by_id(test_id)
+    group_store = get_group_quiz_store(context.application)
 
-    if not test:
-        await query.message.reply_text("Тест не найден.")
-        return REVOKE_ACCESS_SELECT_TEST
-
-    context.user_data["revoke_test_id"] = test_id
-    await query.message.reply_text(
-        f"Выбран тест:\n#{test['id']} | {test['title']}\n\n"
-        f"Теперь отправьте Telegram ID пользователя, у которого нужно убрать доступ."
-    )
-    return REVOKE_ACCESS_ENTER_USER_ID
-
-
-async def revoke_access_enter_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = update.message.text.strip()
-    test_id = context.user_data.get("revoke_test_id")
-
-    if not test_id:
-        await update.message.reply_text("Ошибка. Начните заново.")
-        return ConversationHandler.END
-
-    if not raw.isdigit():
-        await update.message.reply_text("Отправьте только Telegram ID цифрами.")
-        return REVOKE_ACCESS_ENTER_USER_ID
-
-    telegram_id = int(raw)
-    revoke_access(telegram_id, test_id)
-
-    test = get_test_by_id(test_id)
-    await update.message.reply_text(
-        f"✅ Доступ убран.\n\nПользователь ID: {telegram_id}\nТест: {test['title']}",
-        reply_markup=admin_menu_kb(),
-    )
-
-    context.user_data.pop("revoke_test_id", None)
-    return ADMIN_MENU
-
-
-# =========================================================
-# РЕДАКТИРОВАНИЕ
-# =========================================================
-
-async def edit_test_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    test_id = int(query.data.split(":")[1])
-    test = get_test_by_id(test_id)
-
-    if not test:
-        await query.message.reply_text("Тест не найден.")
-        return EDIT_TEST_SELECT
-
-    context.user_data["edit_test_id"] = test_id
-
-    await query.message.reply_text(
-        f"Выбран тест:\n"
-        f"#{test['id']} | {test['title']}\n"
-        f"Раздел: {subject_label(test['subject'])}\n"
-        f"Доступ: {'Бесплатный' if test['access_type'] == 'free' else 'Платный'}\n"
-        f"Таймер: {test['question_timer']} сек\n\n"
-        f"Что хотите изменить?",
-        reply_markup=edit_test_menu_kb(),
-    )
-    return EDIT_TEST_MENU
-
-
-async def edit_test_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    test_id = context.user_data.get("edit_test_id")
-
-    if not test_id:
-        await update.message.reply_text("Ошибка. Начните заново.")
-        return ConversationHandler.END
-
-    if text == "Изменить название":
-        await update.message.reply_text("Введите новое название теста:")
-        return EDIT_TEST_NEW_TITLE
-
-    if text == "Изменить доступ":
-        await update.message.reply_text("Выберите новый доступ:", reply_markup=access_kb())
-        return EDIT_TEST_NEW_ACCESS
-
-    if text == "Изменить таймер":
-        await update.message.reply_text(
-            f"Введите новый таймер в секундах.\nМинимум: {MIN_TIMER}\nМаксимум: {MAX_TIMER}"
-        )
-        return EDIT_TEST_NEW_TIMER
-
-    if text == "Заменить вопросы":
-        await update.message.reply_text(
-            "Отправьте новый блок вопросов.\nСтарые вопросы будут удалены и заменены новыми.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return EDIT_TEST_REPLACE_QUESTIONS
-
-    if text == "Назад в админку":
-        await update.message.reply_text("Админ-панель:", reply_markup=admin_menu_kb())
-        context.user_data.pop("edit_test_id", None)
-        return ADMIN_MENU
-
-    await update.message.reply_text("Выберите действие через кнопки.")
-    return EDIT_TEST_MENU
-
-
-async def edit_test_new_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    test_id = context.user_data.get("edit_test_id")
-    new_title = update.message.text.strip()
-
-    update_test_title(test_id, new_title)
-
-    await update.message.reply_text(
-        f"✅ Название изменено на:\n{new_title}",
-        reply_markup=edit_test_menu_kb(),
-    )
-    return EDIT_TEST_MENU
-
-
-async def edit_test_new_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    test_id = context.user_data.get("edit_test_id")
-    text = update.message.text.strip().lower()
-
-    if text == "бесплатный":
-        new_access = "free"
-    elif text == "платный":
-        new_access = "paid"
-    else:
-        await update.message.reply_text("Нажмите: Бесплатный или Платный")
-        return EDIT_TEST_NEW_ACCESS
-
-    update_test_access(test_id, new_access)
-
-    await update.message.reply_text(
-        f"✅ Доступ изменён: {'Бесплатный' if new_access == 'free' else 'Платный'}",
-        reply_markup=edit_test_menu_kb(),
-    )
-    return EDIT_TEST_MENU
-
-
-async def edit_test_new_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    test_id = context.user_data.get("edit_test_id")
-    raw = update.message.text.strip()
-
-    if not raw.isdigit():
-        await update.message.reply_text("Введите число в секундах.")
-        return EDIT_TEST_NEW_TIMER
-
-    timer = int(raw)
-    if timer < MIN_TIMER or timer > MAX_TIMER:
-        await update.message.reply_text(f"Таймер должен быть от {MIN_TIMER} до {MAX_TIMER} секунд.")
-        return EDIT_TEST_NEW_TIMER
-
-    update_test_timer(test_id, timer)
-
-    await update.message.reply_text(
-        f"✅ Таймер изменён: {timer} сек",
-        reply_markup=edit_test_menu_kb(),
-    )
-    return EDIT_TEST_MENU
-
-
-async def edit_test_replace_questions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    test_id = context.user_data.get("edit_test_id")
-    raw = update.message.text.strip()
-
-    try:
-        parsed_questions = parse_bulk_questions(raw)
-    except ValueError as e:
-        await update.message.reply_text(
-            f"❌ Ошибка в формате вопросов:\n\n{e}\n\nОтправьте вопросы заново."
-        )
-        return EDIT_TEST_REPLACE_QUESTIONS
-
-    replace_test_questions(test_id, parsed_questions)
-
-    await update.message.reply_text(
-        f"✅ Вопросы заменены.\nНовых вопросов: {len(parsed_questions)}",
-        reply_markup=edit_test_menu_kb(),
-    )
-    return EDIT_TEST_MENU
-
-
-# =========================================================
-# УДАЛЕНИЕ
-# =========================================================
-
-async def delete_test_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    test_id = int(query.data.split(":")[1])
-    test = get_test_by_id(test_id)
-
-    if not test:
-        await query.message.reply_text("Тест не найден.")
-        return DELETE_TEST_SELECT
-
-    context.user_data["delete_test_id"] = test_id
-
-    await query.message.reply_text(
-        f"Вы действительно хотите удалить тест?\n\n#{test['id']} | {test['title']}",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Да, удалить", callback_data="confirm_delete_test")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="admin_back_inline")],
-        ]),
-    )
-    return DELETE_TEST_CONFIRM
-
-
-async def confirm_delete_test_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    test_id = context.user_data.get("delete_test_id")
-    if not test_id:
-        await query.message.reply_text("Ошибка удаления.")
-        return ConversationHandler.END
-
-    test = get_test_by_id(test_id)
-    title = test["title"] if test else f"#{test_id}"
-
-    delete_test(test_id)
-    context.user_data.pop("delete_test_id", None)
-
-    await query.message.reply_text(
-        f"✅ Тест удалён: {title}",
-        reply_markup=admin_menu_kb(),
-    )
-    return ADMIN_MENU
-
-
-# =========================================================
-# ОБЩИЕ CALLBACK ДЛЯ АДМИНКИ
-# =========================================================
-
-async def admin_back_inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    await query.message.reply_text("Админ-панель:", reply_markup=admin_menu_kb())
-
-    for key in ["grant_test_id", "revoke_test_id", "edit_test_id", "delete_test_id"]:
-        context.user_data.pop(key, None)
-
-    return ADMIN_MENU
-
-
-# =========================================================
-# ДОП. КОМАНДЫ
-# =========================================================
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    user_id = update.effective_user.id
-    text = (
-        "/start — начать\n"
-        "/help — помощь\n"
-        "/id — показать ваш Telegram ID\n"
-        "/cancel — отмена текущего действия\n"
-        "/stop — остановить групповой тест в чате"
-    )
-    await update.message.reply_text(text, protect_content=protect_for_user(user_id))
-
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-
-    user_id = update.effective_user.id
-
-    await update.message.reply_text(
-        "Действие отменено.",
-        reply_markup=main_menu_kb(user_id),
-        protect_content=protect_for_user(user_id),
-    )
-
-    for key in [
-        "new_test_subject",
-        "new_test_title",
-        "new_test_access",
-        "new_test_timer",
-        "grant_test_id",
-        "revoke_test_id",
-        "edit_test_id",
-        "delete_test_id",
-    ]:
-        context.user_data.pop(key, None)
-
-    return ConversationHandler.END
-
-
-# =========================================================
-# FALLBACK
-# =========================================================
-
-async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    if chat_id not in group_store:
         return
 
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    chat_type = update.effective_chat.type
+    session = group_store[chat_id]
 
-    if is_group_chat(chat_type):
+    session["players"].add(user_id)
+    session["scores"].setdefault(user_id, 0)
+
+    if len(session["players"]) >= MIN_GROUP_PLAYERS and not session["started"]:
+        session["started"] = True
+        await countdown_and_start(chat_id, context)
+
+
+async def countdown_and_start(chat_id, context):
+
+    for i in [3,2,1]:
+        await context.bot.send_message(chat_id, str(i))
+        await asyncio.sleep(1)
+
+    await context.bot.send_message(chat_id, "🚀 Тест начался!")
+
+    await send_group_question(chat_id, context)
+
+
+async def send_group_question(chat_id, context):
+
+    group_store = get_group_quiz_store(context.application)
+    poll_map = get_group_poll_map(context.application)
+
+    session = group_store[chat_id]
+
+    if session["current"] >= len(session["questions"]):
+        await finish_group_quiz(chat_id, context)
         return
 
-    if text == "Админ-панель" and is_admin(user_id):
-        await admin_entry(update, context)
-        return
+    question = session["questions"][session["current"]]
+    options = get_options_for_question(question["id"])
 
-    if text in {"История Казахстана", "Биология", "Химия", "Математическая грамотность"}:
-        await show_subject_topics(update, context)
-        return
+    option_texts = [x["option_text"] for x in options]
+    correct = next(i for i,x in enumerate(options) if x["is_correct"])
 
-    await update.message.reply_text(
-        "Пожалуйста, используйте кнопки меню или команду /start.",
-        protect_content=protect_for_user(user_id),
+    poll = await context.bot.send_poll(
+        chat_id=chat_id,
+        question=f"Вопрос {session['current']+1}",
+        options=option_texts,
+        type=PollType.QUIZ,
+        correct_option_id=correct,
+        is_anonymous=False,
     )
 
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def build_application() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    admin_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("admin", admin_entry),
-            MessageHandler(filters.Regex("^Админ-панель$"), admin_entry),
-        ],
-        states={
-            ADMIN_MENU: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_menu_router),
-            ],
-
-            CREATE_TEST_SUBJECT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, create_test_subject),
-            ],
-            CREATE_TEST_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, create_test_name),
-            ],
-            CREATE_TEST_ACCESS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, create_test_access),
-            ],
-            CREATE_TEST_TIMER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, create_test_timer),
-            ],
-            CREATE_TEST_QUESTIONS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, create_test_questions),
-            ],
-
-            GRANT_ACCESS_SELECT_TEST: [
-                CallbackQueryHandler(grant_test_select_callback, pattern=r"^grant_test:\d+$"),
-                CallbackQueryHandler(admin_back_inline_callback, pattern=r"^admin_back_inline$"),
-            ],
-            GRANT_ACCESS_ENTER_USER_ID: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, grant_access_enter_user_id),
-            ],
-
-            REVOKE_ACCESS_SELECT_TEST: [
-                CallbackQueryHandler(revoke_test_select_callback, pattern=r"^revoke_test:\d+$"),
-                CallbackQueryHandler(admin_back_inline_callback, pattern=r"^admin_back_inline$"),
-            ],
-            REVOKE_ACCESS_ENTER_USER_ID: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, revoke_access_enter_user_id),
-            ],
-
-            EDIT_TEST_SELECT: [
-                CallbackQueryHandler(edit_test_select_callback, pattern=r"^edit_test:\d+$"),
-                CallbackQueryHandler(admin_back_inline_callback, pattern=r"^admin_back_inline$"),
-            ],
-            EDIT_TEST_MENU: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_test_menu_router),
-            ],
-            EDIT_TEST_NEW_TITLE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_test_new_title),
-            ],
-            EDIT_TEST_NEW_ACCESS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_test_new_access),
-            ],
-            EDIT_TEST_NEW_TIMER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_test_new_timer),
-            ],
-            EDIT_TEST_REPLACE_QUESTIONS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_test_replace_questions),
-            ],
-
-            DELETE_TEST_SELECT: [
-                CallbackQueryHandler(delete_test_select_callback, pattern=r"^delete_test:\d+$"),
-                CallbackQueryHandler(admin_back_inline_callback, pattern=r"^admin_back_inline$"),
-            ],
-            DELETE_TEST_CONFIRM: [
-                CallbackQueryHandler(confirm_delete_test_callback, pattern=r"^confirm_delete_test$"),
-                CallbackQueryHandler(admin_back_inline_callback, pattern=r"^admin_back_inline$"),
-            ],
-
-            GROUP_LAUNCH_SELECT: [
-                CallbackQueryHandler(group_launch_test_select_callback, pattern=r"^group_launch_test:\d+$"),
-                CallbackQueryHandler(admin_back_inline_callback, pattern=r"^admin_back_inline$"),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("id", my_id))
-    app.add_handler(CommandHandler("cancel", cancel_command))
-    app.add_handler(CommandHandler("stop", stop_group_quiz))
-
-    app.add_handler(admin_conv)
-
-    app.add_handler(CallbackQueryHandler(open_test_callback, pattern=r"^open_test:\d+$"))
-    app.add_handler(CallbackQueryHandler(start_private_test_callback, pattern=r"^start_private_test:\d+$"))
-    app.add_handler(CallbackQueryHandler(back_to_main_callback, pattern=r"^back_to_main$"))
-    app.add_handler(CallbackQueryHandler(back_to_subject_callback, pattern=r"^back_to_subject:.+$"))
-    app.add_handler(CallbackQueryHandler(finish_test_now_callback, pattern=r"^finish_test_now$"))
-    app.add_handler(CallbackQueryHandler(group_join_quiz_callback, pattern=r"^group_join_quiz$"))
-    app.add_handler(CallbackQueryHandler(continue_group_quiz_callback, pattern=r"^group_continue:\-?\d+$"))
-    app.add_handler(CallbackQueryHandler(finish_group_quiz_callback, pattern=r"^group_finish:\-?\d+$"))
-
-    app.add_handler(PollAnswerHandler(handle_poll_answer))
-
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
-        group_message_guard,
-    ))
-
-    app.add_handler(MessageHandler(
-        filters.Regex("^(История Казахстана|Биология|Химия|Математическая грамотность)$"),
-        show_subject_topics,
-    ))
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
-
-    return app
+    poll_map[poll.poll.id] = {
+        "chat_id": chat_id,
+        "correct": correct
+    }
 
 
-def main() -> None:
-    init_db()
-    application = build_application()
-    logger.info("Bot is running...")
-    application.run_polling()
+async def finish_group_quiz(chat_id, context):
 
+    group_store = get_group_quiz_store(context.application)
 
-if __name__ == "__main__":
-    main()
+    session = group_store[chat_id]
+
+    scores = session["scores"]
+
+    ranking = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    text = "🏆 Результаты\n\n"
+
+    for i,(user,score) in enumerate(ranking,1):
+        text += f"{i}. {user} — {score}\n"
+
+    await context.bot.send_message(chat_id, text)
+
+    del group_store[chat_id]
